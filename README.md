@@ -1,35 +1,86 @@
-# Pacote Core: Flow Turbo Engine (`213–324 vídeos/h` em 1 Aba, `0 Créditos`)
+# FICHA — `flow-turbo-rpc` (Motor Flow RPC 213–324 vídeos/h em 1 Aba, 0 Créditos)
 
-- **Autor**: Jeff (`aifredericai11-lgtm`)
-- **Branch**: `incoming/jeff`
-- **Escopo deste pacote**: **Apenas o núcleo essencial, 100% agnóstico e plug-and-play**, para os demais DEVs implementarem nos próprios sistemas de geração no Google Labs Flow (`labs.google/fx/pt/tools/flow`).
+**Dono:** Jeff (`aifredericai11-lgtm`)
+**Pasta:** `packages/_incoming/jeff/`
+
+## 1. Qual estação?
+
+- [ ] **Infra de contas** — perfil, proxy, fanpage, aquecimento, multilogin
+- [x] **Produção** — criar criativo (imagem, vídeo, copy, montagem)
+- [ ] **Produção retroativa** — recuperar/refazer o que já funcionou
+- [ ] **Postagem** — publicar na página, agendar, conferir
+- [ ] **Análise** — métrica, venda, o que pegou, que página está queimando
+- [ ] **Banco / dados** — onde a operação guarda o estado
+- [ ] Outra:
+
+## 2. O que faz, em 3 linhas
+
+Recebe lista de roteiros (prompt de `startFrame` + 3 prompts de takes com fala) → gera as imagens em `BELUGA` (`0 créditos`, `9:16`) e dispara até **28 takes simultâneos na mesma aba** no `veo_3_1_i2v_lite_low_priority` (`0 créditos`, **com `startFrame`**) via RPC interno `batchexecute` → corta alucinações finais com Faster-Whisper CUDA (`float16`) e concatena via `h264_nvenc` entregando **213 a 324 vídeos completos por hora** em 1 única aba.
+
+## 3. Roda em produção?
+
+- Roda de verdade hoje? **Sim.**
+- Desde quando? **Outubro/2026.**
+- Quanto? **Testado e auditado em lote contínuo de 100 vídeos do zero (100 imagens + 300 takes Veo 3.1 LP com `startFrame` + edição GPU) concluídos em `28.14 minutos` (`213 vídeos/hora`) e lotes curtos de 12 vídeos em `133s–219s` (`197–324 vídeos/hora`) em uma única aba.**
+- Quanto tempo de atenção sua por dia ele exige? **~5 min para disparar a leva.**
+- Quanto custa por mês para rodar? **Assinatura Google Labs Flow (consome `0 créditos` de geração usando `BELUGA` + `veo_3_1_i2v_lite_low_priority`).**
+- Deu resultado? **Mais de 280 vídeos completos gerados e entregues no mesmo dia em 1 única conta sem bloqueio.**
+- Como você sabe hoje qual página gerou uma venda? **Fora do escopo deste pacote (este pacote entrega apenas o motor de geração/edição limpa).**
+
+## 4. Linguagem, dependências e onde roda
+
+- Linguagem/versão: **JavaScript (Extensão Chrome Manifest V3 `world: MAIN`) + Python 3.11+**
+- Principais libs/ferramentas: **`websocket-client` (CDP), `faster-whisper` (CUDA `float16`), `FFmpeg` (`h264_nvenc`), Chrome com `--remote-debugging-port=9225`**
+- Precisa de algum serviço pago para rodar? **Apenas uma conta logada no Google Labs Flow.**
+- Como se instala e roda (o comando):
+  ```bash
+  pip install -r packages/_incoming/jeff/requirements.txt
+  python packages/_incoming/jeff/benchmark_100_videos_turbo.py
+  ```
+- Onde roda: **Windows/Linux, máquina local com GPU NVIDIA (RTX), disparado sob demanda ou em fila contínua.**
+
+## 5. Onde guarda os dados hoje
+
+- Guarda os takes brutos, takes cortados e vídeos finais em disco local (`./output_turbo/takes_brutos`, `./output_turbo/takes_cortados`, `./output_turbo/prontos`).
+- Não depende de banco de dados externo — o estado de geração em andamento vive em memória no dicionário `mapa_uuids` retornado pelo RPC `eb1hJf` e consultado em lote via `jwpduf`.
+
+## 5b. No que ele está amarrado
+
+- Multilogin: **Qualquer navegador Chromium com porta CDP aberta (Chrome puro, AdsPower, GoLogin, etc.).** Como fala com ele: **Conecta por WebSocket CDP (`Runtime.evaluate`) na aba aberta do Flow.** Se trocar o multilogin, quanto quebra? **Nada (basta apontar `FLOW_CDP_PORT` para a porta CDP do navegador).**
+- O que da SUA operação está chumbado no código: **Absolutamente nada. O pacote foi 100% higienizado e desacoplado de nicho, prompts privados ou caminhos locais para que qualquer DEV do grupo possa plugar direto na própria esteira.**
+
+## 6. O que ele NÃO faz / onde quebra
+
+- Exige que a extensão `extensao_flow_rpc/` esteja carregada na aba do Flow e que o usuário já esteja logado em um projeto válido (`https://labs.google/fx/pt/tools/flow/project/<ID>`).
+- Se disparar mais de ~21 takes no exato mesmo milissegundo sem micro-retry, o `batchexecute` retorna `PUBLIC_ERROR_USER_REQUESTS_THROTTLED` para o excedente — por isso o `motor_turbo_cdp.py` usa 4 workers JS com micro-retry de `2.4s`, que absorve o throttle e preenche **27 a 28 takes simultâneos** na GPU do Google.
+- **Zero contas derrubadas**: como tanto o `reCAPTCHA Enterprise` quanto o `batchexecute` rodam dentro da própria aba real do Chrome (`world: MAIN`), o TLS fingerprint, cookies e sessão são 100% nativos.
+
+## 7. Gotchas que você descobriu na marra (O Segredo dos 28 Takes Simultâneos)
+
+1. **Por que todo mundo travava em ~12 takes com `PUBLIC_ERROR_USER_REQUESTS_THROTTLED`?**
+   - Quando você chama o RPC `eb1hJf` (`GenerateVideo`), o Google devolve **2 UUIDs** no array da resposta: o `mediaId` (ID real do vídeo) e o `workflowId` (ID do job).
+   - O método `checkStatus` antigo chamava `jwpduf` (`ListProjectMedia`, que só retorna `mediaId`s) e, para todos os `workflowId`s que não apareciam na lista ou takes ainda gerando, disparava **dezenas de chamadas XHR individuais para o RPC `as29s` (`GetMedia`) a cada ciclo de polling** (+600 RPCs/minuto).
+   - Esse flood de `as29s` estourava o rate-limit do endpoint `batchexecute` e bloqueava novos disparos de vídeo!
+   - **A Correção Cirúrgica (`extensao_flow_rpc/flow-core.js`)**: Removemos completamente as chamadas `as29s` durante o polling de takes em andamento (`generationCode` em `[1, 2, 6]`) e para `workflowId`s. Agora o polling faz **1 única chamada RPC `jwpduf` a cada 4s** para ler o projeto inteiro. Isso reduziu o tráfego de RPC em **96%** e liberou **27 a 28 takes `veo_3_1_i2v_lite_low_priority` com `startFrame` rodando ao mesmo tempo na mesma aba**!
+2. **Assinatura Nativa do `reCAPTCHA Enterprise`**:
+   - O Flow exige o header `x-browser-validation` com token recém-emitido da sitekey `6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV` e action `FLOW_GENERATION`. Rodando no `world: "MAIN"` da aba, basta chamar `await grecaptcha.enterprise.execute('6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV', {action: 'FLOW_GENERATION'})`.
+3. **Lock Global no Faster-Whisper matava o paralelismo local**:
+   - Configurar `WhisperModel("small", device="cuda", compute_type="float16", num_workers=4)` com `beam_size=1` sem lock global permite cortar múltiplos takes simultaneamente em `~0.15s` por take.
+
+## 8. O que você jogaria fora se fosse refazer
+
+- **Jogaria fora**: Qualquer automação baseada em clique de DOM/Playwright nos botões da UI do React do Flow (lenta, quebra quando o layout muda e trava quando a lista de vídeos cresce) e qualquer polling individual com `as29s`.
+- **Manteria a qualquer custo**: O disparo direto via `window.__FLOW` (`batchexecute` RPC `F611Jc` + `eb1hJf`) com polling cirúrgico de 1 único RPC (`jwpduf`) + corte fonético em GPU (`Faster-Whisper` + `h264_nvenc -preset p1`).
+
+## 9. Arquivos pesados (se tiver)
+
+- Nenhum arquivo pesado incluído no Git. Todos os `.mp4` e `.jpg` são gerados localmente em tempo de execução.
 
 ---
 
-## 1. Resumo Executivo & Benchmark Real
+## 10. Guia Técnico Rápido para os DEVs Implementarem
 
-Este pacote entrega a engenharia reversa do protocolo interno **`batchexecute` RPC (Google Wiz / TailwindUi)** do Google Labs Flow combinada com o pipeline de pós-produção em GPU local:
-
-| Métrica | Resultado Auditado (1 Única Aba Chrome `:9225`) |
-| :--- | :--- |
-| **Modelo de Imagem (`startFrame`)** | `BELUGA` / `NARWHAL` (Imagen 3 — **0 créditos**, proporção `9:16`) |
-| **Modelo de Vídeo (`i2v`)** | `veo_3_1_i2v_lite_low_priority` (**0 créditos**, **COM `startFrame`**, 3 takes por vídeo) |
-| **Takes Simultâneos na Mesma Aba** | **27 a 28 takes renderizando ao mesmo tempo** na GPU do Google |
-| **Teste Curto (12 vídeos = 36 takes)** | **`133.3s a 219.4s`** (**`197 a 324 vídeos prontos/hora`**) |
-| **Hard Test (100 vídeos = 100 imagens + 300 takes do zero)** | **`28.14 minutos` (`1688.7s`)** = **`213 vídeos prontos/hora`** |
-
----
-
-## 2. Arquitetura: Os 5 RPC IDs do `batchexecute` (`flow-core.js`)
-
-O Google Labs Flow não utiliza endpoints REST tradicionais (`/api/generate-video`). Todas as operações trafegam por um único endpoint multiplexado:
-
-```text
-POST https://labs.google/fx/_/LabsTailwindUi/data/batchexecute?rpcids=<RPC_ID>
-Content-Type: application/x-www-form-urlencoded;charset=UTF-8
-```
-
-### Mapa de RPC IDs descobertos no bundle `LabsTailwindUi`:
+### Mapa dos 5 RPC IDs do `batchexecute` (`https://labs.google/fx/_/LabsTailwindUi/data/batchexecute`)
 
 | RPC ID | Operação Interna | Função em `window.__FLOW` | Descrição |
 | :--- | :--- | :--- | :--- |
@@ -39,74 +90,7 @@ Content-Type: application/x-www-form-urlencoded;charset=UTF-8
 | **`jwpduf`** | `ListProjectMedia` | `window.__FLOW.checkStatus(uuidArray)` | Lista em **1 única chamada RPC** o status (`generationCode`) e a URL `.mp4` de **todos os takes do projeto**. |
 | **`as29s`** | `GetMedia` | Uso interno sob demanda | Busca metadados individuais de um `mediaId` específico. |
 
----
-
-## 3. Como funciona o Token reCAPTCHA Enterprise Nativo
-
-Cada chamada de escrita (`F611Jc` ou `eb1hJf`) exige um token `reCAPTCHA Enterprise` recém-emitido no header:
-```http
-x-browser-validation: <token_recaptcha>
-```
-Em vez de serviços externos de captcha, o `flow-core.js` roda no `world: "MAIN"` da própria aba autenticada do Chrome e invoca diretamente o SDK oficial já carregado pelo Google:
-
-```javascript
-const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
-const token = await grecaptcha.enterprise.execute(SITE_KEY, {
-  action: "FLOW_GENERATION"
-});
-```
-Como o token é gerado dentro da própria aba legítima do navegador (mesmo TLS fingerprint, mesmos cookies e sessão real), o score é máximo e **não há risco de flag por automação externa**.
-
----
-
-## 4. O Segredo dos `28 Takes Simultâneos`: Correção do Gargalo `jwpduf` vs `as29s`
-
-### Por que outras automações travavam em ~12 takes com `PUBLIC_ERROR_USER_REQUESTS_THROTTLED`?
-1. Quando você dispara `eb1hJf` (`generateVideo`), o Google retorna **2 UUIDs** no payload de resposta:
-   - `mediaId` (ID real do clipe de vídeo)
-   - `workflowId` (ID do job de orquestração)
-2. Na implementação antiga de `checkStatus`, o código chamava `jwpduf` (`ListProjectMedia`, que retorna apenas os `mediaId`s) e, para qualquer UUID que não estivesse pronto ou fosse um `workflowId`, disparava **dezenas de chamadas XHR individuais para `as29s` (`GetMedia`) a cada ciclo de polling**.
-3. Com 20 takes em andamento (40 UUIDs), cada ciclo de polling gerava **+30 chamadas RPC extras no `batchexecute`**, estourando o bucket de rate-limit HTTP do usuário e causando `PUBLIC_ERROR_USER_REQUESTS_THROTTLED` nos próximos disparos de vídeo!
-
-### A Correção Cirúrgica implementada em `extensao_flow_rpc/flow-core.js`:
-- `checkStatus()` agora faz **exclusivamente 1 única chamada RPC `jwpduf`** para buscar o projeto inteiro de uma só vez.
-- **Zero chamadas `as29s`** para `workflowId`s ou vídeos ainda em renderização (`generationCode` em `[1, 2, 6]`).
-- Redução de **96% no tráfego de RPC**, liberando o bucket do `batchexecute` para aceitar **27 a 28 takes `veo_3_1_i2v_lite_low_priority` com `startFrame` simultaneamente na mesma aba**!
-
-```javascript
-// Status codes retornados por jwpduf:
-// 1, 2, 6 = Gerando na GPU do Google
-// 3       = Pronto (contém a URL direta do .mp4)
-// 4, 5    = Falha / Bloqueio de Safety
-```
-
----
-
-## 5. Estrutura dos Arquivos Essenciais deste Repositório
-
-```text
-packages/_incoming/jeff/
-├── FICHA.md                         # Documentação técnica e guia de implementação para DEVs
-├── .env.example                     # Variáveis de ambiente padrão (porta CDP, concorrência)
-├── requirements.txt                 # Dependências Python mínimas
-├── extensao_flow_rpc/               # Extensão Chrome (Manifest V3 - MAIN world)
-│   ├── manifest.json                # Injeção automática em https://labs.google/fx/*
-│   ├── trap-main.js                 # Interceptador de Workspace/Project ID ativo
-│   └── flow-core.js                 # Motor RPC batchexecute + Correção cirúrgica jwpduf
-├── motor_turbo_cdp.py               # SDK Python assíncrono (CDP WebSocket + Fila 4 Workers + Micro-retry 2.4s)
-├── pos_producao_gpu.py              # Corte fonético Faster-Whisper CUDA (float16) + Render FFmpeg h264_nvenc
-└── benchmark_100_videos_turbo.py    # Pipeline de 3 estágios sobrepostos (Frame -> 3 Takes -> GPU Render)
-```
-
----
-
-## 6. Guia Rápido de Implementação para os DEVs
-
-### Passo 1: Carregar a Extensão RPC no Chrome com CDP
-Inicie o Chrome com `--remote-debugging-port=9225` e carregue a pasta `extensao_flow_rpc/` em `chrome://extensions` (Modo do desenvolvedor -> Carregar sem compactação). Abra um projeto no Flow (`https://labs.google/fx/pt/tools/flow/project/<PROJECT_ID>`).
-
-### Passo 2: Usar direto via JavaScript (Console / Puppeteer / Playwright / CDP)
-A extensão expõe `window.__FLOW` na página do Flow:
+### Exemplo de Uso Direto no JS (Console / Puppeteer / Playwright / CDP)
 
 ```javascript
 // 1. Gerar startFrame 9:16 grátis (BELUGA = 0 créditos)
@@ -131,9 +115,3 @@ const vidRes = await window.__FLOW.generateVideo(
 const statusRes = await window.__FLOW.checkStatus(vidRes.uuids);
 // Quando statusRes.items[i].code === 3 -> statusRes.items[i].url traz o .mp4 pronto!
 ```
-
-### Passo 3: Usar o Motor Python de Alta Concorrência (`motor_turbo_cdp.py`)
-Para disparar dezenas de takes em paralelo sem perder slots por rate-limit momentâneo, use `FlowTurboCDP` em [`motor_turbo_cdp.py`](packages/_incoming/jeff/motor_turbo_cdp.py):
-- **4 Workers JS concorrentes** dentro da aba + **micro-retry automático de `2.4s`** quando o `batchexecute` retorna `THROTTLED`.
-- Polling unificado a cada **`4.0s`** via `jwpduf`.
-- Download HTTP em paralelo fora da thread do navegador + corte fonético via GPU (`pos_producao_gpu.py`).
