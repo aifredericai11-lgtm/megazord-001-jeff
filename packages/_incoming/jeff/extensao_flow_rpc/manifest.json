@@ -1,0 +1,77 @@
+{
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "bg.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "trap-main.js"
+      ],
+      "matches": [
+        "https://flow.google.com/*"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "js": [
+        "flow-core.js",
+        "sdk-main.js"
+      ],
+      "matches": [
+        "https://flow.google.com/*"
+      ],
+      "run_at": "document_end",
+      "world": "MAIN"
+    },
+    {
+      "js": [
+        "flow-iso.js"
+      ],
+      "matches": [
+        "https://flow.google.com/*"
+      ],
+      "run_at": "document_end"
+    },
+    {
+      "js": [
+        "site-iso.js"
+      ],
+      "matches": [
+        "https://001system.online/zerum001/*",
+        "https://001system.online/zerum001-ensaio/*",
+        "https://001system.online/zerum001-prototipo/*",
+        "https://001.community/zerum",
+        "https://001.community/zerum/*"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "description": "Conecta as suas contas do Flow ao Zerum da 001.",
+  "host_permissions": [
+    "https://flow.google.com/*",
+    "https://001system.online/zerum-extensao-api/*",
+    "https://001system.online/zerum-extensao-api-ensaio/*",
+    "https://001system.online/zerum001/*",
+    "https://001system.online/zerum001-ensaio/*",
+    "https://001system.online/zerum001-prototipo/*",
+    "https://001.community/zerum",
+    "https://001.community/zerum/*"
+  ],
+  "manifest_version": 3,
+  "name": "Zerum · 001",
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "downloads",
+    "alarms",
+    "system.memory"
+  ],
+  "version": "0.4.18",
+  "minimum_chrome_version": "120"
+}

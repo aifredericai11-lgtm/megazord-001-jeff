@@ -1,0 +1,2 @@
+websocket-client>=1.6.0
+faster-whisper>=1.0.0
