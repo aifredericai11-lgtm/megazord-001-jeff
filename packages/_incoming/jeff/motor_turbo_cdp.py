@@ -20,11 +20,63 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Optional
-import websocket
+from typing import Any, Dict, List, Optional
+
+try:
+    import websocket as _ws_sync
+except ImportError:
+    _ws_sync = None
 
 EXT_DIR = Path(__file__).resolve().parent / "extensao_flow_rpc"
 _SSL_CTX_UNVERIFIED = ssl._create_unverified_context()
+
+
+def _cdp_ws_batch(ws_url: str, commands: List[tuple], timeout: float = 180.0, sleep_after_idx: Optional[Dict[int, float]] = None) -> List[Dict[str, Any]]:
+    """Executa comandos CDP via `websocket-client` ou `websockets` (fallback automático sem erro de módulo)."""
+    if _ws_sync is not None:
+        ws = _ws_sync.create_connection(ws_url, timeout=timeout, suppress_origin=True)
+        try:
+            respostas = []
+            for idx, (method, params) in enumerate(commands):
+                rid = idx + 1 + int((time.time() * 1000) % 1000000)
+                ws.send(json.dumps({"id": rid, "method": method, "params": params or {}}))
+                while True:
+                    msg = json.loads(ws.recv())
+                    if msg.get("id") == rid:
+                        respostas.append(msg)
+                        break
+                if sleep_after_idx and idx in sleep_after_idx:
+                    time.sleep(sleep_after_idx[idx])
+            return respostas
+        finally:
+            ws.close()
+    else:
+        import asyncio
+        import websockets
+
+        async def _run_async():
+            async with websockets.connect(
+                ws_url,
+                max_size=64 * 1024 * 1024,
+                open_timeout=20,
+                close_timeout=5,
+                ping_interval=None,
+            ) as ws:
+                respostas = []
+                for idx, (method, params) in enumerate(commands):
+                    rid = idx + 1 + int((time.time() * 1000) % 1000000)
+                    await ws.send(json.dumps({"id": rid, "method": method, "params": params or {}}))
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                        msg = json.loads(raw)
+                        if msg.get("id") == rid:
+                            respostas.append(msg)
+                            break
+                    if sleep_after_idx and idx in sleep_after_idx:
+                        await asyncio.sleep(sleep_after_idx[idx])
+                return respostas
+
+        return asyncio.run(_run_async())
 
 
 def _urlopen_resiliente(req_or_url, timeout: float = 60.0):
@@ -101,69 +153,94 @@ class FlowTurboCDP:
             return
 
         codigo = trap_js.read_text(encoding="utf-8") + "\n;\n" + core_js.read_text(encoding="utf-8")
-        ws = websocket.create_connection(self.ws_url, timeout=30, suppress_origin=True)
-        try:
-            self._msg_id += 1
-            ws.send(json.dumps({"id": self._msg_id, "method": "Page.enable", "params": {}}))
-            ws.recv()
-            self._msg_id += 1
-            ws.send(json.dumps({
-                "id": self._msg_id,
-                "method": "Page.addScriptToEvaluateOnNewDocument",
-                "params": {"source": codigo},
-            }))
-            ws.recv()
-            # Se a aba estiver em labs.google/fx/.../project/<ID>, migra para https://flow.google.com/project/<ID>
-            # pois o endpoint /_/AiSandboxAngularFrontend/data/batchexecute exige origem flow.google.com
-            self._msg_id += 1
-            ws.send(json.dumps({
-                "id": self._msg_id,
-                "method": "Runtime.evaluate",
-                "params": {
-                    "expression": """(() => {
-                        const m = location.href.match(/project\\/([0-9a-fA-F-]{36})/);
-                        if (location.hostname === 'labs.google' && m) {
-                            location.href = 'https://flow.google.com/project/' + m[1];
-                            return true;
-                        }
-                        return false;
-                    })()""",
-                    "returnByValue": True,
-                },
-            }))
-            ws.recv()
-            self._msg_id += 1
-            ws.send(json.dumps({"id": self._msg_id, "method": "Page.reload", "params": {"ignoreCache": False}}))
-            ws.recv()
-            time.sleep(5.5)
-        finally:
-            ws.close()
+        _cdp_ws_batch(
+            self.ws_url,
+            [
+                ("Page.enable", {}),
+                ("Page.addScriptToEvaluateOnNewDocument", {"source": codigo}),
+                (
+                    "Runtime.evaluate",
+                    {
+                        "expression": """(() => {
+                            const m = location.href.match(/project\\/([0-9a-fA-F-]{36})/);
+                            if (location.hostname === 'labs.google' && m) {
+                                location.href = 'https://flow.google.com/project/' + m[1];
+                                return true;
+                            }
+                            return false;
+                        })()""",
+                        "returnByValue": True,
+                    },
+                ),
+                ("Page.reload", {"ignoreCache": False}),
+            ],
+            timeout=30.0,
+            sleep_after_idx={3: 5.5},
+        )
 
     def eval_js(self, expression: str, timeout: int = 180):
         """Executa uma Promise/expressão JS no contexto MAIN da aba do Flow."""
-        self._msg_id += 1
-        ws = websocket.create_connection(self.ws_url, timeout=timeout, suppress_origin=True)
-        try:
-            payload = {
-                "id": self._msg_id,
-                "method": "Runtime.evaluate",
-                "params": {
-                    "expression": expression,
-                    "awaitPromise": True,
-                    "returnByValue": True,
-                },
-            }
-            ws.send(json.dumps(payload))
-            while True:
-                raw = ws.recv()
-                resp = json.loads(raw)
-                if resp.get("id") == self._msg_id:
-                    res = resp.get("result", {}).get("result", {})
-                    if "value" in res:
-                        return res["value"]
-                    raise RuntimeError(f"Erro JS CDP: {resp}")
-        finally:
-            ws.close()
+        resp = _cdp_ws_batch(
+            self.ws_url,
+            [
+                (
+                    "Runtime.evaluate",
+                    {
+                        "expression": expression,
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                    },
+                )
+            ],
+            timeout=float(timeout),
+        )[0]
+        res = resp.get("result", {}).get("result", {})
+        if "value" in res:
+            return res["value"]
+        raise RuntimeError(f"Erro JS CDP: {resp}")
+
+    def _eval_js(self, expression: str, timeout: int = 180):
+        return self.eval_js(expression, timeout=timeout)
+
+    def gerar_start_frame(
+        self,
+        prompt: str,
+        destino_jpg: Optional[str] = None,
+        modelo_img: str = "BELUGA",
+        proporcao: str = "9:16",
+        refs: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Gera 1 startFrame (BELUGA, 0 créditos) e baixa o .jpg opcionalmente, retornando o mediaId."""
+        res = self.eval_js(
+            f"window.__FLOW.generateImage({json.dumps(prompt)}, 1, {json.dumps(modelo_img)}, {json.dumps(proporcao)}, {json.dumps(refs or [])})",
+            timeout=180,
+        )
+        if isinstance(res, dict) and res.get("ok") and res.get("images"):
+            img0 = res["images"][0]
+            mid = img0.get("mediaId")
+            url = img0.get("url")
+            if destino_jpg and url:
+                os.makedirs(os.path.dirname(os.path.abspath(destino_jpg)), exist_ok=True)
+                self._baixar_mp4(url, destino_jpg)
+            return mid
+        return None
+
+    def disparar_video_veo31(
+        self,
+        prompt: str,
+        start_frame_id: Optional[str] = None,
+        modelo_video: str = "veo_3_1_i2v_lite_low_priority",
+        proporcao: str = "9:16",
+        end_frame_id: Optional[str] = None,
+    ) -> List[str]:
+        """Dispara 1 take de vídeo no Veo 3.1 e retorna a lista de UUIDs candidatos."""
+        res = self.eval_js(
+            f"window.__FLOW.generateVideo({json.dumps(prompt)}, {json.dumps(start_frame_id)}, {json.dumps(proporcao)}, {json.dumps(modelo_video)}, {json.dumps(end_frame_id)})",
+            timeout=120,
+        )
+        if isinstance(res, dict) and res.get("ok"):
+            return list(res.get("uuids") or [])
+        return []
 
     def gerar_startframes_em_lote(
         self,

@@ -42,10 +42,62 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-import websocket
+
+try:
+    import websocket as _ws_sync
+except ImportError:
+    _ws_sync = None
 
 CDP_URL_PADRAO = "http://127.0.0.1:9225"
 _SSL_CTX_UNVERIFIED = ssl._create_unverified_context()
+
+
+def _cdp_ws_batch(ws_url: str, commands: List[tuple], timeout: float = 180.0, sleep_after_idx: Optional[Dict[int, float]] = None) -> List[Dict[str, Any]]:
+    """Executa comandos CDP via `websocket-client` ou `websockets` (fallback automático sem erro de módulo)."""
+    if _ws_sync is not None:
+        ws = _ws_sync.create_connection(ws_url, timeout=timeout, suppress_origin=True)
+        try:
+            respostas = []
+            for idx, (method, params) in enumerate(commands):
+                rid = idx + 1 + int((time.time() * 1000) % 100000000) + threading.get_ident() % 10000
+                ws.send(json.dumps({"id": rid, "method": method, "params": params or {}}))
+                while True:
+                    msg = json.loads(ws.recv())
+                    if msg.get("id") == rid:
+                        respostas.append(msg)
+                        break
+                if sleep_after_idx and idx in sleep_after_idx:
+                    time.sleep(sleep_after_idx[idx])
+            return respostas
+        finally:
+            ws.close()
+    else:
+        import asyncio
+        import websockets
+
+        async def _run_async():
+            async with websockets.connect(
+                ws_url,
+                max_size=64 * 1024 * 1024,
+                open_timeout=20,
+                close_timeout=5,
+                ping_interval=None,
+            ) as ws:
+                respostas = []
+                for idx, (method, params) in enumerate(commands):
+                    rid = idx + 1 + int((time.time() * 1000) % 100000000) + threading.get_ident() % 10000
+                    await ws.send(json.dumps({"id": rid, "method": method, "params": params or {}}))
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                        msg = json.loads(raw)
+                        if msg.get("id") == rid:
+                            respostas.append(msg)
+                            break
+                    if sleep_after_idx and idx in sleep_after_idx:
+                        await asyncio.sleep(sleep_after_idx[idx])
+                return respostas
+
+        return asyncio.run(_run_async())
 
 
 def _urlopen_resiliente(req_or_url, timeout: float = 60.0):
@@ -151,27 +203,14 @@ def recarregar_aba_flow_anti_traffic(cdp_url: str = CDP_URL_PADRAO) -> bool:
                 trap_code = trap_js.read_text(encoding="utf-8") if trap_js.exists() else ""
                 core_code = core_js.read_text(encoding="utf-8") if core_js.exists() else ""
 
-                ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
-                try:
-                    _cdp_send_recv(ws, "Page.enable")
-                    if trap_code or core_code:
-                        _cdp_send_recv(
-                            ws,
-                            "Page.addScriptToEvaluateOnNewDocument",
-                            {"source": trap_code + "\n;\n" + core_code},
-                        )
-                    _cdp_send_recv(ws, "Page.reload", {"ignoreCache": False})
-                    time.sleep(6.0)
-                    # Micro-movimento humano de mouse para aquecer o score reCAPTCHA Enterprise v3
-                    for x, y in ((380, 320), (490, 410), (610, 480)):
-                        _cdp_send_recv(
-                            ws,
-                            "Input.dispatchMouseEvent",
-                            {"type": "mouseMoved", "x": x, "y": y},
-                        )
-                        time.sleep(0.25)
-                finally:
-                    ws.close()
+                cmds: List[tuple] = [("Page.enable", {})]
+                if trap_code or core_code:
+                    cmds.append(("Page.addScriptToEvaluateOnNewDocument", {"source": trap_code + "\n;\n" + core_code}))
+                reload_idx = len(cmds)
+                cmds.append(("Page.reload", {"ignoreCache": False}))
+                for x, y in ((380, 320), (490, 410), (610, 480)):
+                    cmds.append(("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}))
+                _cdp_ws_batch(ws_url, cmds, timeout=30.0, sleep_after_idx={reload_idx: 6.0})
 
                 with _WS_CACHE_LOCK:
                     _WS_URL_CACHE.pop(cdp_url, None)
@@ -199,21 +238,22 @@ def eval_flow_js_paralelo(
         try:
             ws_url = _obter_ws_url_flow_cached(cdp_url, force_refresh=(att > 0))
             with _WS_CONCURRENCY_SEM:
-                ws = websocket.create_connection(ws_url, timeout=timeout_s, suppress_origin=True)
-                try:
-                    msg = _cdp_send_recv(
-                        ws,
-                        "Runtime.evaluate",
-                        {
-                            "expression": expr,
-                            "awaitPromise": True,
-                            "returnByValue": True,
-                        },
-                    )
-                    res_obj = (msg.get("result") or {}).get("result") or {}
-                    val = res_obj.get("value")
-                finally:
-                    ws.close()
+                msg = _cdp_ws_batch(
+                    ws_url,
+                    [
+                        (
+                            "Runtime.evaluate",
+                            {
+                                "expression": expr,
+                                "awaitPromise": True,
+                                "returnByValue": True,
+                            },
+                        )
+                    ],
+                    timeout=timeout_s,
+                )[0]
+                res_obj = (msg.get("result") or {}).get("result") or {}
+                val = res_obj.get("value")
 
             if isinstance(val, dict) and val.get("erro") == "CORE_NAO_INJETADO":
                 recarregar_aba_flow_anti_traffic(cdp_url)
@@ -502,4 +542,44 @@ def aguardar_midia_rpc_v2(
         time.sleep(intervalo_s)
 
     return {"ok": False, "erro": f"TIMEOUT_{timeout_s}S", "cands": cands}
+
+
+class FlowTurboCDP:
+    """Wrapper OO compatível com `motor_turbo_cdp.py` sobre o motor v2 anti-Unusual Activity."""
+
+    def __init__(self, cdp_port: int = 9225):
+        self.cdp_port = cdp_port
+        self.cdp_url = f"http://127.0.0.1:{cdp_port}"
+        self.ws_url = _obter_ws_url_flow_cached(self.cdp_url, force_refresh=True)
+
+    def eval_js(self, expression: str, timeout: int = 180) -> Any:
+        return eval_flow_js_paralelo(f"async () => ({expression})", None, cdp_url=self.cdp_url, timeout_s=float(timeout))
+
+    def _eval_js(self, expression: str, timeout: int = 180) -> Any:
+        return self.eval_js(expression, timeout=timeout)
+
+    def gerar_start_frame(
+        self,
+        prompt: str,
+        destino_jpg: Optional[str] = None,
+        modelo_img: str = "BELUGA",
+        refs: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        r = gerar_imagem_rpc_v2(prompt=prompt, refs=refs, modelo=modelo_img, aspecto=2, cdp_url=self.cdp_url)
+        if isinstance(r, dict) and r.get("ok"):
+            dl = aguardar_midia_rpc_v2(r, tipo="image", destino_arquivo=destino_jpg, cdp_url=self.cdp_url)
+            return str(dl.get("mediaId") or r.get("mediaId") or "")
+        return None
+
+    def disparar_video_veo31(
+        self,
+        prompt: str,
+        start_frame_id: Optional[str] = None,
+        modelo_video: str = "veo_3_1_i2v_lite_low_priority",
+    ) -> List[str]:
+        r = gerar_video_rpc_v2(prompt=prompt, first_frame_id=start_frame_id, modelo=modelo_video, tipo="i2v", aspecto=1, cdp_url=self.cdp_url)
+        if isinstance(r, dict) and r.get("ok"):
+            return list(r.get("cands") or [])
+        return []
+
 
