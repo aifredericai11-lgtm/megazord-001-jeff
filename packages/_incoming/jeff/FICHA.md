@@ -34,10 +34,13 @@ Recebe lista de roteiros (prompt de `startFrame` + 3 prompts de takes com fala) 
 - Precisa de algum serviço pago para rodar? **Apenas uma conta logada no Google Labs Flow.**
 - Como se instala e roda (o comando):
   ```bash
-  pip install -r packages/_incoming/jeff/requirements.txt
-  python packages/_incoming/jeff/benchmark_100_videos_turbo.py
+  # Windows / Linux / MacBook (macOS Apple Silicon M1/M2/M3/M4 ou Intel):
+  pip3 install -r packages/_incoming/jeff/requirements.txt
+  python3 packages/_incoming/jeff/abrir_chrome_flow.py
+  # (Faça login no Google Flow na janela aberta e entre em um projeto /project/<ID>)
+  python3 packages/_incoming/jeff/benchmark_100_videos_turbo.py
   ```
-- Onde roda: **Windows/Linux, máquina local com GPU NVIDIA (RTX), disparado sob demanda ou em fila contínua.**
+- Onde roda: **Multiplataforma 100% compatível: Windows/Linux (GPU NVIDIA CUDA + `h264_nvenc`) e MacBook macOS (Apple Silicon M1/M2/M3/M4 + `h264_videotoolbox` + CPU ARM64 `int8`).**
 
 ## 5. Onde guarda os dados hoje
 

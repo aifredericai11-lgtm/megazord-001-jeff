@@ -1,49 +1,148 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-motor_turbo_cdp.py — SDK Essencial de Alta Concorrência para Google Labs Flow via CDP
-=====================================================================================
-Conecta a uma aba autenticada do Google Labs Flow (com `extensao_flow_rpc` ativa)
+motor_turbo_cdp.py — SDK Essencial de Alta Concorrência para Google Labs Flow via CDP (Mac & Windows)
+=====================================================================================================
+Conecta a uma aba autenticada do Google Labs Flow (com `extensao_flow_rpc` ativa ou auto-injetada)
 via Chrome DevTools Protocol (WebSocket) e executa:
   1. Geração em lote de `startFrame`s (modelo `BELUGA` — 0 créditos, 9:16).
   2. Disparo em rajada de takes de vídeo (`veo_3_1_i2v_lite_low_priority` — 0 créditos)
      ancorados em `startFrame` (i2v), mantendo até 28 takes simultâneos na mesma aba
      através de 4 workers JS + micro-retry de 2.4s.
   3. Polling cirúrgico de 1 único RPC (`jwpduf`) a cada 4 segundos.
-  4. Download HTTP multithread dos arquivos `.mp4` assim que `code == 3`.
+  4. Download HTTP multithread dos arquivos `.mp4` assim que `code == 3` (com suporte SSL macOS).
 """
 
 import json
 import os
+import ssl
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Dict, List, Optional
 import websocket
+
+EXT_DIR = Path(__file__).resolve().parent / "extensao_flow_rpc"
+_SSL_CTX_UNVERIFIED = ssl._create_unverified_context()
+
+
+def _urlopen_resiliente(req_or_url, timeout: float = 60.0):
+    """Faz urlopen com fallback automático para contexto SSL sem verificação (evita erro SSL no MacBook)."""
+    try:
+        return urllib.request.urlopen(req_or_url, timeout=timeout)
+    except Exception as e:
+        if "CERTIFICATE_VERIFY_FAILED" in str(e) or "SSL" in str(e):
+            return urllib.request.urlopen(req_or_url, timeout=timeout, context=_SSL_CTX_UNVERIFIED)
+        raise
 
 
 class FlowTurboCDP:
     def __init__(self, cdp_port: int = 9225):
         self.cdp_port = cdp_port
-        self.ws_url = self._descobrir_aba_flow()
         self._msg_id = 0
+        self.ws_url = self._descobrir_aba_flow()
+        self._garantir_core_injetado()
 
     def _descobrir_aba_flow(self) -> str:
-        url = f"http://127.0.0.1:{self.cdp_port}/json"
-        req = urllib.request.urlopen(url, timeout=5)
-        abas = json.loads(req.read().decode("utf-8"))
+        url = f"http://127.0.0.1:{self.cdp_port}/json/list"
+        try:
+            with _urlopen_resiliente(url, timeout=5) as req:
+                abas = json.loads(req.read().decode("utf-8"))
+        except Exception:
+            # Tenta abrir o Chrome automaticamente no Mac/Windows caso a porta 9225 esteja fechada
+            try:
+                from abrir_chrome_flow import garantir_chrome_flow_aberto
+                garantir_chrome_flow_aberto(self.cdp_port)
+                time.sleep(2.0)
+                with _urlopen_resiliente(url, timeout=5) as req:
+                    abas = json.loads(req.read().decode("utf-8"))
+            except Exception as e:
+                raise RuntimeError(
+                    f"Não foi possível conectar ao Chrome na porta {self.cdp_port} ({e}).\n"
+                    f"Rode primeiro: python abrir_chrome_flow.py"
+                )
+
+        # Prioridade 1: Aba com /project/ aberto (flow.google.com ou labs.google)
         for aba in abas:
-            if "labs.google/fx" in aba.get("url", "") and aba.get("type") == "page":
-                return aba["webSocketDebuggerUrl"]
+            u = str(aba.get("url", ""))
+            if aba.get("type") == "page" and ("flow.google.com/project/" in u or ("labs.google" in u and "/project/" in u)):
+                if aba.get("webSocketDebuggerUrl"):
+                    return aba["webSocketDebuggerUrl"]
+
+        # Prioridade 2: Qualquer aba do Flow/Labs
+        for aba in abas:
+            u = str(aba.get("url", ""))
+            if aba.get("type") == "page" and ("flow.google.com" in u or "labs.google/fx" in u):
+                if aba.get("webSocketDebuggerUrl"):
+                    return aba["webSocketDebuggerUrl"]
+
         raise RuntimeError(
-            f"Nenhuma aba do Google Labs Flow encontrada em 127.0.0.1:{self.cdp_port}. "
-            "Abra https://labs.google/fx/pt/tools/flow/project/<ID> no Chrome."
+            f"Nenhuma aba do Google Flow encontrada em 127.0.0.1:{self.cdp_port}.\n"
+            "Abra um projeto em https://flow.google.com/project/<ID> na janela do Chrome aberta pelo script."
         )
+
+    def _garantir_core_injetado(self) -> None:
+        """
+        Verifica se `window.__FLOW` e `window.__zerumCandidateCoreV1` estão ativos na aba.
+        Se o usuário no MacBook/Windows não tiver carregado a extensão, injeta `trap-main.js` + `flow-core.js`
+        via CDP (`Page.addScriptToEvaluateOnNewDocument`) e recarrega a aba automaticamente!
+        """
+        try:
+            ok = self.eval_js("Boolean(window.__FLOW && window.__zerumCandidateCoreV1 && window.__zerumCandidateCoreV1.info().armadilha)", timeout=10)
+            if ok:
+                return
+        except Exception:
+            pass
+
+        trap_js = EXT_DIR / "trap-main.js"
+        core_js = EXT_DIR / "flow-core.js"
+        if not trap_js.exists() or not core_js.exists():
+            return
+
+        codigo = trap_js.read_text(encoding="utf-8") + "\n;\n" + core_js.read_text(encoding="utf-8")
+        ws = websocket.create_connection(self.ws_url, timeout=30, suppress_origin=True)
+        try:
+            self._msg_id += 1
+            ws.send(json.dumps({"id": self._msg_id, "method": "Page.enable", "params": {}}))
+            ws.recv()
+            self._msg_id += 1
+            ws.send(json.dumps({
+                "id": self._msg_id,
+                "method": "Page.addScriptToEvaluateOnNewDocument",
+                "params": {"source": codigo},
+            }))
+            ws.recv()
+            # Se a aba estiver em labs.google/fx/.../project/<ID>, migra para https://flow.google.com/project/<ID>
+            # pois o endpoint /_/AiSandboxAngularFrontend/data/batchexecute exige origem flow.google.com
+            self._msg_id += 1
+            ws.send(json.dumps({
+                "id": self._msg_id,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": """(() => {
+                        const m = location.href.match(/project\\/([0-9a-fA-F-]{36})/);
+                        if (location.hostname === 'labs.google' && m) {
+                            location.href = 'https://flow.google.com/project/' + m[1];
+                            return true;
+                        }
+                        return false;
+                    })()""",
+                    "returnByValue": True,
+                },
+            }))
+            ws.recv()
+            self._msg_id += 1
+            ws.send(json.dumps({"id": self._msg_id, "method": "Page.reload", "params": {"ignoreCache": False}}))
+            ws.recv()
+            time.sleep(5.5)
+        finally:
+            ws.close()
 
     def eval_js(self, expression: str, timeout: int = 180):
         """Executa uma Promise/expressão JS no contexto MAIN da aba do Flow."""
         self._msg_id += 1
-        ws = websocket.create_connection(self.ws_url, timeout=timeout)
+        ws = websocket.create_connection(self.ws_url, timeout=timeout, suppress_origin=True)
         try:
             payload = {
                 "id": self._msg_id,
@@ -120,16 +219,10 @@ class FlowTurboCDP:
         """
         Dispara uma lista de takes no Veo 3.1 (com startFrame) usando 4 workers JS + micro-retry 2.4s
         e faz polling cirúrgico via `jwpduf` (1 único RPC por ciclo) até todos ficarem prontos.
-
-        `takes`: lista de dicts:
-            `[{"key": "v01_t1", "prompt": "...", "start_frame_id": "<mediaId>"}]`
-        Retorna:
-            `{"v01_t1": "/caminho/para/v01_t1.mp4", ...}`
         """
         os.makedirs(pasta_saida, exist_ok=True)
         takes_json = json.dumps(takes, ensure_ascii=False)
 
-        # 1. Disparo concorrente na aba com micro-retry de 2.4s contra THROTTLED
         js_disparo = f"""
         (async () => {{
             const fila = {takes_json};
@@ -164,7 +257,6 @@ class FlowTurboCDP:
         """
         mapa_uuids: Dict[str, List[str]] = self.eval_js(js_disparo, timeout=600)
 
-        # 2. Polling cirúrgico de 1 único RPC (jwpduf) + Download HTTP paralelo
         pendentes = dict(mapa_uuids)
         arquivos_baixados: Dict[str, str] = {}
         t0 = time.time()
@@ -207,9 +299,24 @@ class FlowTurboCDP:
 
         return arquivos_baixados
 
-    @staticmethod
-    def _baixar_mp4(url: str, destino: str) -> Optional[str]:
+    def _baixar_mp4(self, url: str, destino: str) -> Optional[str]:
+        # 1ª tentativa: download direto autenticado dentro da própria aba do Chrome (com cookies da conta Google)
+        try:
+            res_b64 = self.eval_js(
+                f"window.__zerumCandidateCoreV1.baixarBase64({json.dumps(url)})",
+                timeout=90,
+            )
+            if isinstance(res_b64, dict) and res_b64.get("ok") and res_b64.get("base64"):
+                import base64
+                with open(destino, "wb") as f:
+                    f.write(base64.b64decode(res_b64["base64"]))
+                if os.path.exists(destino) and os.path.getsize(destino) > 10_000:
+                    return destino
+        except Exception:
+            pass
+
+        # 2ª tentativa: download HTTP direto via Python
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=60) as r, open(destino, "wb") as f:
+        with _urlopen_resiliente(req, timeout=60) as r, open(destino, "wb") as f:
             f.write(r.read())
         return destino if os.path.exists(destino) and os.path.getsize(destino) > 10_000 else None

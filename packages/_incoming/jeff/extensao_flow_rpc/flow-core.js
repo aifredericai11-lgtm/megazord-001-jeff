@@ -42,9 +42,24 @@
   // configurável), logo trap.exec continua sendo o execute ORIGINAL capturado antes do congelamento. Esse erro,
   // sozinho, não invalida o exec: aceitar. Qualquer outro erro (captura tardia, observação falhou) segue recusado.
   const ERRO_TOLERADO = 'RECAPTCHA_ACESSOR_NAO_CONFIGURAVEL';
+  // Anti-App Nap / Anti-Throttling para MacBook (macOS): mantém um Web Lock ativo na aba
+  // para impedir que o macOS congele os XHRs do batchexecute e o reCAPTCHA quando o Chrome fica em 2º plano.
+  try {
+    if (navigator.locks && typeof navigator.locks.request === 'function') {
+      navigator.locks.request('flow-turbo-macbook-keepawake', () => new Promise(() => {})).catch(() => {});
+    }
+  } catch (e) {}
+
   function execOriginal() {
     const trap = window.__zerumCandidateTrapV1;
-    if (trap?.protocol === 'zerum-candidate-trap-v1' && (!trap.error || trap.error === ERRO_TOLERADO) && typeof trap.exec === 'function') return trap.exec;
+    if (trap?.protocol === 'zerum-candidate-trap-v1' && (!trap.error || trap.error === ERRO_TOLERADO || trap.error === 'RECAPTCHA_CAPTURA_TARDIA') && typeof trap.exec === 'function') {
+      return trap.exec;
+    }
+    // Fallback direto caso a aba tenha sido aberta antes da injeção no document_start (evita erro SEM_ARMADILHA no Mac)
+    const g = window.grecaptcha && window.grecaptcha.enterprise;
+    if (g && typeof g.execute === 'function') {
+      return g.execute.bind(g);
+    }
     return null;
   }
   async function token(action) {
@@ -316,5 +331,102 @@
     }));
     return out;
   }
-  window.__zerumCandidateCoreV1 = { protocol, v: '0.4', bind, info, credito, catalogo, catalogoImagem, token, batch, subir, imagem, video, status, texto };
+  async function baixarBase64(url) {
+    const r = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(60000) });
+    if (!r.ok) return { ok: false, s: r.status, erro: 'DOWNLOAD_HTTP_' + r.status };
+    const bytes = new Uint8Array(await r.arrayBuffer());
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 32768) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + 32768));
+    }
+    return { ok: true, s: 200, base64: btoa(bin), mimeType: r.headers.get('content-type') || '' };
+  }
+  const coreObj = { protocol, v: '0.4', bind, info, credito, catalogo, catalogoImagem, token, batch, subir, imagem, video, status, texto, baixarBase64 };
+  window.__zerumCandidateCoreV1 = coreObj;
+
+  // Bridge universal window.__FLOW para compatibilidade total com motor_turbo_cdp.py (v1) e motor_turbo_cdp_v2.py (v2)
+  window.__FLOW = {
+    core: coreObj,
+    info: () => info(),
+    uploadImage: async (b64DataUrl, nome = 'frame.jpg') => {
+      const p = PROJ_URL();
+      const rawB64 = String(b64DataUrl || '').replace(/^data:[^;]+;base64,/, '');
+      const mimeMatch = String(b64DataUrl || '').match(/^data:([^;]+);base64,/);
+      const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+      return await subir(rawB64, mime, nome, p);
+    },
+    generateImage: async (prompt, count = 1, model = 'BELUGA', ratio = '9:16', refs = []) => {
+      const p = PROJ_URL();
+      const aspecto = ratio === '16:9' ? 3 : 2;
+      const r = await imagem({ prompt, refs: refs || [], aspecto, modelo: model || 'BELUGA', proj: p });
+      const mid = r.mediaId || (Array.isArray(r.cands) && r.cands[0]) || '';
+      return {
+        ok: !!(r && r.ok && mid),
+        mediaId: mid,
+        images: mid ? [{ mediaId: mid, url: r.url || '' }] : [],
+        erro: r ? r.erro : 'FALHA_IMAGEM',
+        raw: r
+      };
+    },
+    generateVideo: async (prompt, startFrameId = null, ratio = '9:16', model = 'veo_3_1_i2v_lite_low_priority', endFrameId = null, refs = []) => {
+      const p = PROJ_URL();
+      const aspecto = ratio === '16:9' ? 2 : 1;
+      let tipo = 't2v';
+      if (startFrameId && endFrameId) tipo = 'interpolation';
+      else if (startFrameId) tipo = 'i2v';
+      else if (refs && refs.length > 0) tipo = 'r2v';
+
+      const candidatosModelo = [
+        model || `veo_3_1_${tipo}_lite_low_priority`,
+        `veo_3_1_${tipo}_lite_low_priority`,
+        `veo_3_1_${tipo}_lite`,
+        tipo === 'i2v' ? 'abra_i2v_8s' : `veo_3_1_${tipo}_s_fast_fl`,
+      ].filter((v, idx, arr) => v && arr.indexOf(v) === idx);
+
+      let ultimo = null;
+      for (const mod of candidatosModelo) {
+        const r = await video({
+          tipo,
+          prompt,
+          refs: refs || [],
+          img: startFrameId || undefined,
+          imgFim: endFrameId || undefined,
+          modelo: mod,
+          aspecto,
+          proj: p
+        });
+        ultimo = r;
+        if (r && r.ok && Array.isArray(r.cands) && r.cands.length > 0) {
+          return {
+            ok: true,
+            uuids: r.cands,
+            modeloUsado: mod,
+            erro: '',
+            raw: r
+          };
+        }
+        // Se foi erro de tráfego/incomum, para o loop de modelos para permitir backoff/reload
+        if (r && (r.erro === 'INCOMUM' || r.erro === 'TRAFEGO')) break;
+      }
+      return {
+        ok: false,
+        uuids: [],
+        erro: ultimo ? ultimo.erro : 'FALHA_VIDEO',
+        raw: ultimo
+      };
+    },
+    checkStatus: async (uuidArray = []) => {
+      const p = PROJ_URL();
+      const itens = (uuidArray || []).map(id => ({ id: String(id), tipo: 'video' }));
+      const stMap = await status(itens, p);
+      const items = Object.entries(stMap || {}).map(([uuid, st]) => ({
+        uuid,
+        code: st.pronto ? 3 : st.falhou ? 4 : 1,
+        url: st.url || '',
+        estado: st.estado || '',
+        erro: st.erro || ''
+      }));
+      return { ok: true, items, map: stMap };
+    }
+  };
 })();

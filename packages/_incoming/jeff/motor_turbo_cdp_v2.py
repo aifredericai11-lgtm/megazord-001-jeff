@@ -35,6 +35,7 @@ import base64
 import json
 import mimetypes
 import os
+import ssl
 import threading
 import time
 import urllib.request
@@ -44,6 +45,17 @@ from typing import Any, Dict, List, Optional
 import websocket
 
 CDP_URL_PADRAO = "http://127.0.0.1:9225"
+_SSL_CTX_UNVERIFIED = ssl._create_unverified_context()
+
+
+def _urlopen_resiliente(req_or_url, timeout: float = 60.0):
+    """Faz urlopen com fallback automático para contexto SSL sem verificação (evita erro SSL no MacBook)."""
+    try:
+        return urllib.request.urlopen(req_or_url, timeout=timeout)
+    except Exception as e:
+        if "CERTIFICATE_VERIFY_FAILED" in str(e) or "SSL" in str(e):
+            return urllib.request.urlopen(req_or_url, timeout=timeout, context=_SSL_CTX_UNVERIFIED)
+        raise
 
 _CDP_RPC_LOCK = threading.Lock()
 _VID_DISPATCH_LOCK = threading.Lock()
@@ -78,10 +90,27 @@ def _obter_ws_url_flow_cached(cdp_url: str = CDP_URL_PADRAO, force_refresh: bool
         cached = _WS_URL_CACHE.get(cdp_url)
         if not force_refresh and cached and (agora - cached[0]) < 15.0:
             return cached[1]
-        tabs = json.loads(urllib.request.urlopen(f"{cdp_url.rstrip('/')}/json/list", timeout=4.0).read().decode("utf-8"))
+        try:
+            tabs = json.loads(_urlopen_resiliente(f"{cdp_url.rstrip('/')}/json/list", timeout=4.0).read().decode("utf-8"))
+        except Exception:
+            try:
+                from abrir_chrome_flow import garantir_chrome_flow_aberto
+                garantir_chrome_flow_aberto()
+                time.sleep(2.0)
+                tabs = json.loads(_urlopen_resiliente(f"{cdp_url.rstrip('/')}/json/list", timeout=4.0).read().decode("utf-8"))
+            except Exception as e:
+                raise RuntimeError(
+                    f"Não foi possível conectar ao Chrome em {cdp_url} ({e}). Rode: python3 abrir_chrome_flow.py"
+                )
         for t in tabs:
             u = str(t.get("url") or "")
             if t.get("type") == "page" and ("flow.google.com/project/" in u or ("labs.google" in u and "/project/" in u)) and t.get("webSocketDebuggerUrl"):
+                ws_u = str(t["webSocketDebuggerUrl"])
+                _WS_URL_CACHE[cdp_url] = (agora, ws_u)
+                return ws_u
+        for t in tabs:
+            u = str(t.get("url") or "")
+            if t.get("type") == "page" and ("flow.google.com" in u or "labs.google/fx" in u) and t.get("webSocketDebuggerUrl"):
                 ws_u = str(t["webSocketDebuggerUrl"])
                 _WS_URL_CACHE[cdp_url] = (agora, ws_u)
                 return ws_u
@@ -122,7 +151,7 @@ def recarregar_aba_flow_anti_traffic(cdp_url: str = CDP_URL_PADRAO) -> bool:
                 trap_code = trap_js.read_text(encoding="utf-8") if trap_js.exists() else ""
                 core_code = core_js.read_text(encoding="utf-8") if core_js.exists() else ""
 
-                ws = websocket.create_connection(ws_url, timeout=30)
+                ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
                 try:
                     _cdp_send_recv(ws, "Page.enable")
                     if trap_code or core_code:
@@ -170,7 +199,7 @@ def eval_flow_js_paralelo(
         try:
             ws_url = _obter_ws_url_flow_cached(cdp_url, force_refresh=(att > 0))
             with _WS_CONCURRENCY_SEM:
-                ws = websocket.create_connection(ws_url, timeout=timeout_s)
+                ws = websocket.create_connection(ws_url, timeout=timeout_s, suppress_origin=True)
                 try:
                     msg = _cdp_send_recv(
                         ws,
@@ -305,7 +334,15 @@ def gerar_video_rpc_v2(
     Dispara geração de vídeo (`eb1hJf` i2v / `MZZa6b` r2v / `nprQif` interpolation / `YhhmEf` t2v)
     com micro-cadenciamento não-bloqueante de `2.2s` na partida e auto-reload contra `INCOMUM`.
     """
-    modelos_tentativa = [modelo or "veo_3_1_i2v_lite_low_priority"]
+    modelos_tentativa = []
+    for m_cand in (
+        modelo or f"veo_3_1_{tipo}_lite_low_priority",
+        f"veo_3_1_{tipo}_lite_low_priority",
+        f"veo_3_1_{tipo}_lite",
+        "abra_i2v_8s" if tipo == "i2v" else f"veo_3_1_{tipo}_s_fast_fl",
+    ):
+        if m_cand and m_cand not in modelos_tentativa:
+            modelos_tentativa.append(m_cand)
 
     res = None
     for _ in range(4):
@@ -365,6 +402,46 @@ def gerar_video_rpc_v2(
     return res
 
 
+def _baixar_midia_autenticada_flow(url_midia: str, dest: Path, cdp_url: str = CDP_URL_PADRAO) -> bool:
+    """
+    Baixa `https://flow-content.google/image/<ID>` ou `/video/<ID>` usando `fetch(..., {credentials: 'include'})`
+    dentro da própria aba autenticada do Chrome (evitando HTTP 401/403 por falta de cookies Google no Python),
+    com fallback para download HTTP direto.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        res_b64 = eval_flow_js_paralelo(
+            """async ({ url }) => {
+                const c = window.__zerumCandidateCoreV1;
+                if (c && typeof c.baixarBase64 === 'function') {
+                    return await c.baixarBase64(url);
+                }
+                const r = await fetch(url, { credentials: 'include' });
+                if (!r.ok) return { ok: false, s: r.status };
+                const bytes = new Uint8Array(await r.arrayBuffer());
+                let bin = '';
+                for (let i = 0; i < bytes.length; i += 32768) {
+                    bin += String.fromCharCode(...bytes.subarray(i, i + 32768));
+                }
+                return { ok: true, base64: btoa(bin) };
+            }""",
+            {"url": url_midia},
+            cdp_url=cdp_url,
+            timeout_s=90.0,
+        )
+        if isinstance(res_b64, dict) and res_b64.get("ok") and res_b64.get("base64"):
+            dest.write_bytes(base64.b64decode(res_b64["base64"]))
+            if dest.exists() and dest.stat().st_size > 1000:
+                return True
+    except Exception:
+        pass
+
+    req = urllib.request.Request(url_midia, headers={"User-Agent": "Mozilla/5.0"})
+    with _urlopen_resiliente(req, timeout=90) as r:
+        dest.write_bytes(r.read())
+    return dest.exists() and dest.stat().st_size > 1000
+
+
 def aguardar_midia_rpc_v2(
     candidatos_ou_resposta: List[str] | Dict[str, Any],
     tipo: str = "video",
@@ -375,17 +452,14 @@ def aguardar_midia_rpc_v2(
 ) -> Dict[str, Any]:
     """
     Faz polling cirúrgico via `c.status` (`jwpduf`, 1 único RPC por ciclo sem flood de `as29s`)
-    e baixa o arquivo final (`.jpg` ou `.mp4`) fora do lock CDP.
+    e baixa o arquivo final (`.jpg` ou `.mp4`) autenticado com os cookies da aba.
     """
     if isinstance(candidatos_ou_resposta, dict):
         if candidatos_ou_resposta.get("url") and destino_arquivo:
             url_direta = candidatos_ou_resposta["url"]
             mid = candidatos_ou_resposta.get("mediaId") or (candidatos_ou_resposta.get("cands") or [""])[0]
             dest = Path(destino_arquivo)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            req = urllib.request.Request(url_direta, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                dest.write_bytes(r.read())
+            _baixar_midia_autenticada_flow(url_direta, dest, cdp_url=cdp_url)
             return {"ok": True, "mediaId": mid, "url": url_direta, "arquivo": str(dest)}
         cands = list(candidatos_ou_resposta.get("cands") or candidatos_ou_resposta.get("candidatos") or [])
         if candidatos_ou_resposta.get("mediaId") and candidatos_ou_resposta["mediaId"] not in cands:
@@ -420,10 +494,7 @@ def aguardar_midia_rpc_v2(
                     res_out = {"ok": True, "mediaId": cid, "url": url_final, "status": info_id}
                     if destino_arquivo:
                         dest = Path(destino_arquivo)
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        req = urllib.request.Request(url_final, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req, timeout=90) as r:
-                            dest.write_bytes(r.read())
+                        _baixar_midia_autenticada_flow(url_final, dest, cdp_url=cdp_url)
                         res_out["arquivo"] = str(dest)
                     return res_out
                 if info_id.get("falhou"):
@@ -431,3 +502,4 @@ def aguardar_midia_rpc_v2(
         time.sleep(intervalo_s)
 
     return {"ok": False, "erro": f"TIMEOUT_{timeout_s}S", "cands": cands}
+
